@@ -1,0 +1,165 @@
+name: 'Find and tag most recent image'
+description: 'Finds most recent commit with image built and tags it with v* tag'
+inputs:
+  tag:
+    description: 'v* tag to use when tagging image'
+    required: true
+  ECR_REGISTRY:
+    description: 'AWS ECR registry where images are'
+    required: true
+  aws-account: 
+    description: 'Aws account to assume'
+    required: false
+    default: 'bisnow'
+  aws-region:
+    description: 'aws region where ECR repo is'
+    required: false
+    default: 'us-east-1'
+
+outputs:
+  git_sha: 
+    description: 'Git SHA that was tagged'
+    value: ${{ steps.find_image_commit.outputs.git_sha }}
+  dev_tag: 
+    description: 'Dev tag found'
+    value: ${{ steps.find_image_commit.outputs.dev_tag }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate tag format
+      id: validate
+      shell: bash
+      run: |
+        TAG="${{ inputs.tag }}"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+        # Check if tag starts with 'v' and follows semantic versioning pattern
+        if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+          echo "is_valid=true" >> $GITHUB_OUTPUT
+          echo "✅ Valid tag format: $TAG"
+        else
+          echo "is_valid=false" >> $GITHUB_OUTPUT
+          echo "❌ Invalid tag format: $TAG"
+          echo "Tag must start with 'v' and follow semantic versioning (e.g., v1.0.0)"
+          exit 1
+        fi
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Assume role for AWS Account
+      uses: bisnow/github-actions-assume-role-for-environment@main
+      with:
+        aws-account: ${{ inputs.aws-account }}
+
+    - name: Find Most Recent Commit with Image
+      id: find_image_commit
+      shell: bash
+      run: |
+        # Extract repo name from registry URL (everything after first /)
+        REPO_NAME="${{ inputs.ECR_REGISTRY }}"
+        REPO_NAME="${REPO_NAME#*/}"
+        echo "Repository name: $REPO_NAME"
+
+        echo "🔍 Searching for most recent commit with a built image..."
+
+        GIT_SHA=""
+        DEV_TAG=""
+        COMMIT_OFFSET=""
+
+        # Check the last 20 commits to find one with an image
+        for i in {1..20}; do
+          SHA=$(git rev-parse HEAD~$i 2>/dev/null || echo "")
+
+          if [ -z "$SHA" ]; then
+            echo "❌ No more commits to check"
+            break
+          fi
+
+          echo "Checking commit $i: $SHA"
+
+          # Check if image exists in ECR
+          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} >/dev/null 2>&1; then
+            echo "✅ Found image for commit: $SHA"
+            GIT_SHA="$SHA"
+            COMMIT_OFFSET="$i"
+
+            # Get the dev tag associated with this commit
+            DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -o 'dev-[0-9]*' | head -1)
+
+            if [ -n "$DEV_TAG" ]; then
+              echo "📦 Found associated dev tag: $DEV_TAG"
+            else
+              echo "⚠️ No dev tag found for this commit"
+            fi
+
+            break
+          else
+            echo "⏳ No image found for commit $i, checking next..."
+          fi
+        done
+
+        # Verify we found a commit
+        if [ -z "$GIT_SHA" ]; then
+          echo "❌ No image found in the last 20 commits!"
+          echo "This suggests a serious issue with the build process."
+          exit 1
+        fi
+
+        # Set outputs
+        echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
+        echo "dev_tag=$DEV_TAG" >> $GITHUB_OUTPUT
+        echo "commit_offset=$COMMIT_OFFSET" >> $GITHUB_OUTPUT
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+      with:
+        region: ${{ inputs.aws-region }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Tag Image with Release Tag
+      shell: bash
+      run: |
+        set -e  # Exit on any error
+
+        # Create and push the release tag
+        RELEASE_TAG="${{ inputs.tag }}"
+        GIT_SHA="${{ steps.find_image_commit.outputs.git_sha }}"
+        DEV_TAG="${{ steps.find_image_commit.outputs.dev_tag }}"
+
+        echo "📦 Creating release manifest based on most recent commit with image"
+        echo "Git SHA: $GIT_SHA"
+        echo "Dev tag: $DEV_TAG"
+        echo "Release tag: $RELEASE_TAG"
+
+        # Create a new multi-platform manifest that includes both dev and release tags
+        # This creates a manifest with both tags pointing to the same image content
+        if [ -n "$DEV_TAG" ]; then
+          echo "Creating manifest with dev tag and release tag..."
+          docker buildx imagetools create \
+            --tag ${{ inputs.ECR_REGISTRY }}:$DEV_TAG \
+            --tag ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG \
+            ${{ inputs.ECR_REGISTRY }}:$GIT_SHA
+        else
+          echo "Creating manifest with only release tag (no dev tag found)..."
+          docker buildx imagetools create \
+            --tag ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG \
+            ${{ inputs.ECR_REGISTRY }}:$GIT_SHA
+        fi
+
+        # Verify the manifest was created successfully
+        echo "Verifying release manifest was created..."
+        docker buildx imagetools inspect ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG
+
+        echo "✅ Successfully created release manifest"
+        echo "Release tag: ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG"
+        if [ -n "$DEV_TAG" ]; then
+          echo "Dev tag: ${{ inputs.ECR_REGISTRY }}:$DEV_TAG"
+        fi
+        echo "Based on Git SHA: $GIT_SHA"
+        echo "Commit offset: ${{ steps.find_image_commit.outputs.commit_offset }}"
