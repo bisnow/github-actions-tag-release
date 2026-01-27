@@ -15,6 +15,14 @@ inputs:
     description: 'aws region where ECR repo is'
     required: false
     default: 'us-east-1'
+  build-workflow-name:
+    description: 'Name of the build workflow to wait for'
+    required: false
+    default: 'Build and Deploy to Dev'
+  max-wait-seconds:
+    description: 'Maximum seconds to wait for build workflows to complete'
+    required: false
+    default: '600'
 
 outputs:
   git_sha: 
@@ -37,10 +45,10 @@ runs:
         # Check if tag starts with 'v' and follows semantic versioning pattern
         if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
           echo "is_valid=true" >> $GITHUB_OUTPUT
-          echo "✅ Valid tag format: $TAG"
+          echo "Valid tag format: $TAG"
         else
           echo "is_valid=false" >> $GITHUB_OUTPUT
-          echo "❌ Invalid tag format: $TAG"
+          echo "Invalid tag format: $TAG"
           echo "Tag must start with 'v' and follow semantic versioning (e.g., v1.0.0)"
           exit 1
         fi
@@ -54,6 +62,44 @@ runs:
       uses: bisnow/github-actions-assume-role-for-environment@main
       with:
         aws-account: ${{ inputs.aws-account }}
+
+    - name: Wait for In-Progress Build Workflows
+      shell: bash
+      run: |
+        echo "Checking for in-progress build workflows..."
+
+        MAX_WAIT=${{ inputs.max-wait-seconds }}
+        ELAPSED=0
+        WORKFLOW_NAME="${{ inputs.build-workflow-name }}"
+
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # Check for any in-progress builds
+          RUNNING_BUILDS=$(gh run list \
+            --workflow="$WORKFLOW_NAME" \
+            --status=in_progress \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId' 2>/dev/null || echo "")
+
+          # Break if no builds are running
+          if [ -z "$RUNNING_BUILDS" ] || [ "$RUNNING_BUILDS" = "null" ]; then
+            echo "No build workflows in progress"
+            break
+          fi
+
+          echo "Build workflow in progress (Run ID: $RUNNING_BUILDS), waiting... (${ELAPSED}s/${MAX_WAIT}s)"
+          sleep 10
+          ELAPSED=$((ELAPSED + 10))
+        done
+
+        # Check if we timed out
+        if [ $ELAPSED -ge $MAX_WAIT ]; then
+          echo "Timeout: Build workflows did not complete within $MAX_WAIT seconds"
+          echo "Please wait for builds to finish before creating a release tag"
+          exit 1
+        fi
+
+        echo "All build workflows complete, proceeding to find image..."
 
     - name: Find Most Recent Commit with Image
       id: find_image_commit
@@ -71,11 +117,11 @@ runs:
         COMMIT_OFFSET=""
 
         # Check the last 20 commits to find one with an image
-        for i in {1..20}; do
+        for i in {0..20}; do
           SHA=$(git rev-parse HEAD~$i 2>/dev/null || echo "")
 
           if [ -z "$SHA" ]; then
-            echo "❌ No more commits to check"
+            echo "No more commits to check"
             break
           fi
 
@@ -83,7 +129,7 @@ runs:
 
           # Check if image exists in ECR
           if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} >/dev/null 2>&1; then
-            echo "✅ Found image for commit: $SHA"
+            echo "Found image for commit: $SHA"
             GIT_SHA="$SHA"
             COMMIT_OFFSET="$i"
 
@@ -91,20 +137,20 @@ runs:
             DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -o 'dev-[0-9]*' | head -1)
 
             if [ -n "$DEV_TAG" ]; then
-              echo "📦 Found associated dev tag: $DEV_TAG"
+              echo "Found associated dev tag: $DEV_TAG"
             else
-              echo "⚠️ No dev tag found for this commit"
+              echo "No dev tag found for this commit"
             fi
 
             break
           else
-            echo "⏳ No image found for commit $i, checking next..."
+            echo "No image found for commit $i, checking next..."
           fi
         done
 
         # Verify we found a commit
         if [ -z "$GIT_SHA" ]; then
-          echo "❌ No image found in the last 20 commits!"
+          echo "No image found in the last 20 commits!"
           echo "This suggests a serious issue with the build process."
           exit 1
         fi
@@ -130,7 +176,7 @@ runs:
         GIT_SHA="${{ steps.find_image_commit.outputs.git_sha }}"
         DEV_TAG="${{ steps.find_image_commit.outputs.dev_tag }}"
 
-        echo "📦 Creating release manifest based on most recent commit with image"
+        echo "Creating release manifest based on most recent commit with image"
         echo "Git SHA: $GIT_SHA"
         echo "Dev tag: $DEV_TAG"
         echo "Release tag: $RELEASE_TAG"
@@ -154,10 +200,20 @@ runs:
         echo "Verifying release manifest was created..."
         docker buildx imagetools inspect ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG
 
-        echo "✅ Successfully created release manifest"
-        echo "Release tag: ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG"
+        # Get commit details for final summary
+        COMMIT_MSG=$(git log -1 --pretty=format:"%s" $GIT_SHA)
+        COMMIT_AUTHOR=$(git log -1 --pretty=format:"%an" $GIT_SHA)
+        COMMIT_DATE=$(git log -1 --pretty=format:"%ar" $GIT_SHA)
+
+        echo "Successfully Created Release"
+        echo "=========================================="
+        echo "Release Tag:    ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG"
         if [ -n "$DEV_TAG" ]; then
-          echo "Dev tag: ${{ inputs.ECR_REGISTRY }}:$DEV_TAG"
+          echo "Dev Tag:        ${{ inputs.ECR_REGISTRY }}:$DEV_TAG"
         fi
-        echo "Based on Git SHA: $GIT_SHA"
-        echo "Commit offset: ${{ steps.find_image_commit.outputs.commit_offset }}"
+        echo "Commit SHA:     $GIT_SHA"
+        echo "Commit Offset:  HEAD~${{ steps.find_image_commit.outputs.commit_offset }}"
+        echo "Commit Message: $COMMIT_MSG"
+        echo "Commit Author:  $COMMIT_AUTHOR"
+        echo "Commit Date:    $COMMIT_DATE"
+        echo "=========================================="
