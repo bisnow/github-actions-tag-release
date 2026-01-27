@@ -65,6 +65,8 @@ runs:
 
     - name: Wait for In-Progress Build Workflows
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         echo "Checking for running build workflows..."
         echo "Workflow to check: ${{ inputs.build-workflow-name }}"
