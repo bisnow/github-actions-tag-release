@@ -110,7 +110,7 @@ runs:
         REPO_NAME="${REPO_NAME#*/}"
         echo "Repository name: $REPO_NAME"
 
-        echo "🔍 Searching for most recent commit with a built image..."
+        echo "Searching for most recent commit with a built image..."
 
         GIT_SHA=""
         DEV_TAG=""
@@ -134,7 +134,7 @@ runs:
             COMMIT_OFFSET="$i"
 
             # Get the dev tag associated with this commit
-            DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -o 'dev-[0-9]*' | head -1)
+            DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -o 'dev-[0-9]*' | head -1 || true)
 
             if [ -n "$DEV_TAG" ]; then
               echo "Found associated dev tag: $DEV_TAG"
