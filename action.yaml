@@ -18,7 +18,7 @@ inputs:
   build-workflow-name:
     description: 'Name of the build workflow to wait for'
     required: false
-    default: 'Build and Deploy to Dev'
+    default: 'Build and Deploy to nonprod'
   max-wait-seconds:
     description: 'Maximum seconds to wait for build workflows to complete'
     required: false
@@ -66,28 +66,32 @@ runs:
     - name: Wait for In-Progress Build Workflows
       shell: bash
       run: |
-        echo "Checking for in-progress build workflows..."
+        echo "Checking for running build workflows..."
+        echo "Workflow to check: ${{ inputs.build-workflow-name }}"
 
         MAX_WAIT=${{ inputs.max-wait-seconds }}
         ELAPSED=0
         WORKFLOW_NAME="${{ inputs.build-workflow-name }}"
 
+        # Show current workflow runs for debugging
+        echo "Current workflow runs:"
+        gh run list --workflow="$WORKFLOW_NAME" --limit=3 2>/dev/null || echo "Unable to list workflows"
+
         while [ $ELAPSED -lt $MAX_WAIT ]; do
-          # Check for any in-progress builds
+          # Check for any in-progress or queued builds
           RUNNING_BUILDS=$(gh run list \
             --workflow="$WORKFLOW_NAME" \
-            --status=in_progress \
-            --limit=1 \
-            --json databaseId \
-            --jq '.[0].databaseId' 2>/dev/null || echo "")
+            --limit=10 \
+            --json databaseId,status \
+            --jq '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' 2>/dev/null | head -1 || echo "")
 
           # Break if no builds are running
           if [ -z "$RUNNING_BUILDS" ] || [ "$RUNNING_BUILDS" = "null" ]; then
-            echo "No build workflows in progress"
+            echo "No build workflows in progress or queued"
             break
           fi
 
-          echo "Build workflow in progress (Run ID: $RUNNING_BUILDS), waiting... (${ELAPSED}s/${MAX_WAIT}s)"
+          echo "Build workflow running (Run ID: $RUNNING_BUILDS), waiting... (${ELAPSED}s/${MAX_WAIT}s)"
           sleep 10
           ELAPSED=$((ELAPSED + 10))
         done
