@@ -20,8 +20,8 @@ outputs:
   git_sha: 
     description: 'Git SHA that was tagged'
     value: ${{ steps.find_image_commit.outputs.git_sha }}
-  dev_tag: 
-    description: 'Dev tag found'
+  dev_tag:
+    description: 'Dev or RC tag found'
     value: ${{ steps.find_image_commit.outputs.dev_tag }}
 
 runs:
@@ -87,13 +87,13 @@ runs:
             GIT_SHA="$SHA"
             COMMIT_OFFSET="$i"
 
-            # Get the dev tag associated with this commit
-            DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -o 'dev-[0-9]*' | head -1)
+            # Get the dev or rc tag associated with this commit
+            DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -oE '(dev|rc)-[0-9]+' | head -1 || true)
 
             if [ -n "$DEV_TAG" ]; then
-              echo "📦 Found associated dev tag: $DEV_TAG"
+              echo "📦 Found associated dev/rc tag: $DEV_TAG"
             else
-              echo "⚠️ No dev tag found for this commit"
+              echo "⚠️ No dev/rc tag found for this commit"
             fi
 
             break
@@ -132,19 +132,19 @@ runs:
 
         echo "📦 Creating release manifest based on most recent commit with image"
         echo "Git SHA: $GIT_SHA"
-        echo "Dev tag: $DEV_TAG"
+        echo "Dev/RC tag: $DEV_TAG"
         echo "Release tag: $RELEASE_TAG"
 
         # Create a new multi-platform manifest that includes both dev and release tags
         # This creates a manifest with both tags pointing to the same image content
         if [ -n "$DEV_TAG" ]; then
-          echo "Creating manifest with dev tag and release tag..."
+          echo "Creating manifest with dev/rc tag and release tag..."
           docker buildx imagetools create \
             --tag ${{ inputs.ECR_REGISTRY }}:$DEV_TAG \
             --tag ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG \
             ${{ inputs.ECR_REGISTRY }}:$GIT_SHA
         else
-          echo "Creating manifest with only release tag (no dev tag found)..."
+          echo "Creating manifest with only release tag (no dev/rc tag found)..."
           docker buildx imagetools create \
             --tag ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG \
             ${{ inputs.ECR_REGISTRY }}:$GIT_SHA
@@ -157,7 +157,7 @@ runs:
         echo "✅ Successfully created release manifest"
         echo "Release tag: ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG"
         if [ -n "$DEV_TAG" ]; then
-          echo "Dev tag: ${{ inputs.ECR_REGISTRY }}:$DEV_TAG"
+          echo "Dev/RC tag: ${{ inputs.ECR_REGISTRY }}:$DEV_TAG"
         fi
         echo "Based on Git SHA: $GIT_SHA"
         echo "Commit offset: ${{ steps.find_image_commit.outputs.commit_offset }}"

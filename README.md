@@ -5,7 +5,7 @@ This is used in the k8s deploy process
 
 ## What it does
 
-This action searches through your recent commits to find the most recent one that has a Docker image built in ECR, then tags that image with your specified release version (e.g., `v1.0.0`).
+This action searches through your recent commits (up to the last 20) to find the most recent one that has a Docker image built in ECR, then tags that image with your specified release version (e.g., `v1.0.0`). The action will also preserve any associated dev or RC tags when creating the release manifest.
 
 ## Usage
 
@@ -43,4 +43,4 @@ jobs:
 | Output | Description |
 |--------|-------------|
 | `git_sha` | Git SHA that was tagged |
-| `dev_tag` | Dev tag found for the commit |
+| `dev_tag` | Dev or RC tag found for the commit |
