@@ -130,7 +130,7 @@ runs:
         GIT_SHA="${{ steps.find_image_commit.outputs.git_sha }}"
         DEV_TAG="${{ steps.find_image_commit.outputs.dev_tag }}"
 
-        echo "📦 Creating release manifest based on most recent commit with image"
+        echo "Creating release manifest based on most recent commit with image"
         echo "Git SHA: $GIT_SHA"
         echo "Dev/RC tag: $DEV_TAG"
         echo "Release tag: $RELEASE_TAG"
@@ -184,12 +184,15 @@ runs:
         - **Release Tag**: \`$RELEASE_TAG\`
         - **ECR Registry**: \`$ECR_REGISTRY\`
         
-        ## Source Commit Details
+        ## Which Commit Was Tagged?
+        This action searched backwards through your recent commits to find the **most recent commit with a successfully built Docker image** in ECR.
+        
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        ### Commit Details
         - **Git SHA**: \`$GIT_SHA\`
         - **Commit Message**: $COMMIT_MSG
         - **Author**: $COMMIT_AUTHOR
         - **Committed**: $COMMIT_DATE
-        - **Commit Offset**: HEAD~$COMMIT_OFFSET (searched last 20 commits)
         
         EOF
         
@@ -203,7 +206,7 @@ runs:
         else
           cat >> $GITHUB_STEP_SUMMARY << EOF
         ## Associated Tags
-        - ⚠️ No dev/rc tag found for this commit
+        - No dev/rc tag found for this commit
         
         EOF
         fi
