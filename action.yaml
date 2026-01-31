@@ -161,3 +161,65 @@ runs:
         fi
         echo "Based on Git SHA: $GIT_SHA"
         echo "Commit offset: ${{ steps.find_image_commit.outputs.commit_offset }}"
+
+    - name: Create GitHub Summary
+      shell: bash
+      run: |
+        GIT_SHA="${{ steps.find_image_commit.outputs.git_sha }}"
+        DEV_TAG="${{ steps.find_image_commit.outputs.dev_tag }}"
+        RELEASE_TAG="${{ inputs.tag }}"
+        COMMIT_OFFSET="${{ steps.find_image_commit.outputs.commit_offset }}"
+        ECR_REGISTRY="${{ inputs.ECR_REGISTRY }}"
+        
+        # Get commit message and author
+        COMMIT_MSG=$(git log -1 --pretty=format:'%s' $GIT_SHA)
+        COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an' $GIT_SHA)
+        COMMIT_DATE=$(git log -1 --pretty=format:'%ar' $GIT_SHA)
+        
+        # Create summary
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        # Release Tagged Successfully
+        
+        ## Release Information
+        - **Release Tag**: \`$RELEASE_TAG\`
+        - **ECR Registry**: \`$ECR_REGISTRY\`
+        
+        ## Source Commit Details
+        - **Git SHA**: \`$GIT_SHA\`
+        - **Commit Message**: $COMMIT_MSG
+        - **Author**: $COMMIT_AUTHOR
+        - **Committed**: $COMMIT_DATE
+        - **Commit Offset**: HEAD~$COMMIT_OFFSET (searched last 20 commits)
+        
+        EOF
+        
+        # Add dev/rc tag info if available
+        if [ -n "$DEV_TAG" ]; then
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+        ## Associated Tags
+        - **Dev/RC Tag**: \`$DEV_TAG\`
+        
+        EOF
+        else
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+        ## Associated Tags
+        - ⚠️ No dev/rc tag found for this commit
+        
+        EOF
+        fi
+        
+        # Add debugging links
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        ## Debugging Links
+        - [View Commit on GitHub](${{ github.server_url }}/${{ github.repository }}/commit/$GIT_SHA)
+        - [View ECR Images](https://console.aws.amazon.com/ecr/repositories/private/${{ inputs.aws-account }}/$ECR_REGISTRY?region=${{ inputs.aws-region }})
+        
+        ## Tagged Images
+        The following images now point to the same manifest:
+        - \`$ECR_REGISTRY:$GIT_SHA\` (original SHA tag)
+        - \`$ECR_REGISTRY:$RELEASE_TAG\` (release tag)
+        EOF
+        
+        if [ -n "$DEV_TAG" ]; then
+          echo "- \`$ECR_REGISTRY:$DEV_TAG\` (dev/rc tag)" >> $GITHUB_STEP_SUMMARY
+        fi
