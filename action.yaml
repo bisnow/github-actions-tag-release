@@ -170,7 +170,9 @@ runs:
         RELEASE_TAG="${{ inputs.tag }}"
         COMMIT_OFFSET="${{ steps.find_image_commit.outputs.commit_offset }}"
         ECR_REGISTRY="${{ inputs.ECR_REGISTRY }}"
-        
+        ACCOUNT_ID=$(echo "$ECR_REGISTRY" | cut -d. -f1)
+        REPO_NAME="${ECR_REGISTRY#*/}"
+
         # Get commit message and author
         COMMIT_MSG=$(git log -1 --pretty=format:'%s' $GIT_SHA)
         COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an' $GIT_SHA)
@@ -216,7 +218,7 @@ runs:
         ## Debugging Links
         EOF
         echo "- [View Commit on GitHub](${{ github.server_url }}/${{ github.repository }}/commit/$GIT_SHA)" >> $GITHUB_STEP_SUMMARY
-        echo "- [View ECR Images](https://console.aws.amazon.com/ecr/repositories/private/${{ inputs.aws-account }}/$ECR_REGISTRY?region=${{ inputs.aws-region }})" >> $GITHUB_STEP_SUMMARY
+        echo "- [View ECR Images](https://console.aws.amazon.com/ecr/repositories/private/$ACCOUNT_ID/$REPO_NAME?region=${{ inputs.aws-region }})" >> $GITHUB_STEP_SUMMARY
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         
         ## Tagged Images
