@@ -71,7 +71,7 @@ runs:
         COMMIT_OFFSET=""
 
         # Check the last 20 commits to find one with an image
-        for i in {1..20}; do
+        for i in {0..20}; do
           SHA=$(git rev-parse HEAD~$i 2>/dev/null || echo "")
 
           if [ -z "$SHA" ]; then
