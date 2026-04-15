@@ -27,6 +27,44 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Wait for build to complete on this commit
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        echo "Waiting for build workflow on commit ${{ github.sha }}..."
+        for i in $(seq 1 60); do
+          result=$(gh run list \
+            --repo ${{ github.repository }} \
+            --workflow=build.yml \
+            --commit=${{ github.sha }} \
+            --json status,conclusion \
+            --jq '.[0]')
+
+          if [[ -z "$result" || "$result" == "null" ]]; then
+            echo "No build run found yet, retrying... ($i/60)"
+            sleep 30
+            continue
+          fi
+
+          status=$(echo "$result" | jq -r '.status')
+          conclusion=$(echo "$result" | jq -r '.conclusion')
+          echo "Build status: $status, conclusion: $conclusion"
+
+          if [[ "$status" == "completed" && "$conclusion" == "success" ]]; then
+            echo "✅ Build completed successfully."
+            exit 0
+          elif [[ "$status" == "completed" ]]; then
+            echo "❌ Build did not succeed (conclusion: $conclusion). Aborting tag."
+            exit 1
+          fi
+
+          echo "Still in progress, retrying in 30s... ($i/60)"
+          sleep 30
+        done
+        echo "❌ Timed out after 30 minutes waiting for build."
+        exit 1
+
     - name: Validate tag format
       id: validate
       shell: bash
