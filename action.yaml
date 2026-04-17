@@ -15,6 +15,10 @@ inputs:
     description: 'aws region where ECR repo is'
     required: false
     default: 'us-east-1'
+  build-workflow:
+    description: 'Filename of the build workflow to wait for'
+    required: false
+    default: 'build.yml'
 
 outputs:
   git_sha: 
@@ -27,6 +31,55 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Wait for build to complete on this commit
+      id: wait-for-build
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        COMMIT_MSG=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.commit.message')
+        if echo "$COMMIT_MSG" | grep -q '\[skip ci\]'; then
+          WAIT_SHA=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.parents[0].sha')
+          echo "Tagged commit has [skip ci], waiting for build on parent: $WAIT_SHA"
+        else
+          WAIT_SHA="${{ github.sha }}"
+        fi
+
+        echo "Waiting for build workflow on commit $WAIT_SHA..."
+        for i in $(seq 1 60); do
+          result=$(gh run list \
+            --repo ${{ github.repository }} \
+            --workflow=${{ inputs.build-workflow }} \
+            --commit=$WAIT_SHA \
+            --limit 100 \
+            --json status,conclusion \
+            --jq '.[0]')
+
+          if [[ -z "$result" || "$result" == "null" ]]; then
+            echo "No build run found yet, retrying... ($i/60)"
+            sleep 30
+            continue
+          fi
+
+          status=$(echo "$result" | jq -r '.status')
+          conclusion=$(echo "$result" | jq -r '.conclusion')
+          echo "Build status: $status, conclusion: $conclusion"
+
+          if [[ "$status" == "completed" && "$conclusion" == "success" ]]; then
+            echo "✅ Build completed successfully."
+            echo "build_sha=$WAIT_SHA" >> $GITHUB_OUTPUT
+            exit 0
+          elif [[ "$status" == "completed" ]]; then
+            echo "❌ Build did not succeed (conclusion: $conclusion). Aborting tag."
+            exit 1
+          fi
+
+          echo "Still in progress, retrying in 30s... ($i/60)"
+          sleep 30
+        done
+        echo "❌ Timed out after 30 minutes waiting for build."
+        exit 1
+
     - name: Validate tag format
       id: validate
       shell: bash
@@ -55,64 +108,34 @@ runs:
       with:
         aws-account: ${{ inputs.aws-account }}
 
-    - name: Find Most Recent Commit with Image
+    - name: Find Image for Build Commit
       id: find_image_commit
       shell: bash
       run: |
-        # Extract repo name from registry URL (everything after first /)
+        GIT_SHA="${{ steps.wait-for-build.outputs.build_sha }}"
         REPO_NAME="${{ inputs.ECR_REGISTRY }}"
         REPO_NAME="${REPO_NAME#*/}"
-        echo "Repository name: $REPO_NAME"
 
-        echo "🔍 Searching for most recent commit with a built image..."
+        echo "🔍 Looking up image for commit: $GIT_SHA"
 
-        GIT_SHA=""
-        DEV_TAG=""
-        COMMIT_OFFSET=""
-
-        # Check the last 20 commits to find one with an image
-        for i in {0..20}; do
-          SHA=$(git rev-parse HEAD~$i 2>/dev/null || echo "")
-
-          if [ -z "$SHA" ]; then
-            echo "❌ No more commits to check"
-            break
-          fi
-
-          echo "Checking commit $i: $SHA"
-
-          # Check if image exists in ECR
-          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} >/dev/null 2>&1; then
-            echo "✅ Found image for commit: $SHA"
-            GIT_SHA="$SHA"
-            COMMIT_OFFSET="$i"
-
-            # Get the dev or rc tag associated with this commit
-            DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -oE '(dev|rc)-[0-9]+' | head -1 || true)
-
-            if [ -n "$DEV_TAG" ]; then
-              echo "📦 Found associated dev/rc tag: $DEV_TAG"
-            else
-              echo "⚠️ No dev/rc tag found for this commit"
-            fi
-
-            break
-          else
-            echo "⏳ No image found for commit $i, checking next..."
-          fi
-        done
-
-        # Verify we found a commit
-        if [ -z "$GIT_SHA" ]; then
-          echo "❌ No image found in the last 20 commits!"
-          echo "This suggests a serious issue with the build process."
+        if ! aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GIT_SHA --region ${{ inputs.aws-region }} >/dev/null 2>&1; then
+          echo "❌ No image found in ECR for commit $GIT_SHA"
+          echo "This suggests the build did not push an image despite reporting success."
           exit 1
         fi
 
-        # Set outputs
+        echo "✅ Found image for commit: $GIT_SHA"
+
+        DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GIT_SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -oE '(dev|rc)-[0-9]+' | head -1 || true)
+
+        if [ -n "$DEV_TAG" ]; then
+          echo "📦 Found associated dev/rc tag: $DEV_TAG"
+        else
+          echo "⚠️ No dev/rc tag found for this commit"
+        fi
+
         echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
         echo "dev_tag=$DEV_TAG" >> $GITHUB_OUTPUT
-        echo "commit_offset=$COMMIT_OFFSET" >> $GITHUB_OUTPUT
 
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v2
