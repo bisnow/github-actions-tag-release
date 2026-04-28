@@ -37,13 +37,18 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        COMMIT_MSG=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.commit.message')
-        if echo "$COMMIT_MSG" | grep -q '\[skip ci\]'; then
-          WAIT_SHA=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.parents[0].sha')
-          echo "Tagged commit has [skip ci], waiting for build on parent: $WAIT_SHA"
-        else
-          WAIT_SHA="${{ github.sha }}"
-        fi
+        SKIP_RE='\[(skip ci|ci skip|no ci|skip actions|actions skip)\]|(^|[[:space:]])skip-checks:[[:space:]]*true'
+        WAIT_SHA="${{ github.sha }}"
+        for hop in $(seq 1 10); do
+          COMMIT_MSG=$(gh api repos/${{ github.repository }}/commits/$WAIT_SHA --jq '.commit.message')
+          if echo "$COMMIT_MSG" | grep -qE "$SKIP_RE"; then
+            PARENT=$(gh api repos/${{ github.repository }}/commits/$WAIT_SHA --jq '.parents[0].sha')
+            echo "Commit $WAIT_SHA skips CI, walking back to parent: $PARENT"
+            WAIT_SHA="$PARENT"
+            continue
+          fi
+          break
+        done
 
         echo "Waiting for build workflow on commit $WAIT_SHA..."
         for i in $(seq 1 60); do
