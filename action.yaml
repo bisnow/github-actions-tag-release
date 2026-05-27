@@ -40,10 +40,26 @@ runs:
         SKIP_RE='\[(skip ci|ci skip|no ci|skip actions|actions skip)\]|(^|[[:space:]])skip-checks:[[:space:]]*true'
         WAIT_SHA="${{ github.sha }}"
         for hop in $(seq 1 10); do
+          # Prefer a real build run over the commit-message hint. A skip-CI
+          # marker only tells us GitHub *might* have suppressed the push
+          # trigger - it does not mean no build exists. A manually
+          # dispatched build on this SHA is just as valid as a push build.
+          RUN=$(gh run list \
+            --repo ${{ github.repository }} \
+            --workflow=${{ inputs.build-workflow }} \
+            --commit=$WAIT_SHA \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0]')
+          if [[ -n "$RUN" && "$RUN" != "null" ]]; then
+            echo "Found build run for $WAIT_SHA - will wait on this commit."
+            break
+          fi
+
           COMMIT_MSG=$(gh api repos/${{ github.repository }}/commits/$WAIT_SHA --jq '.commit.message')
           if echo "$COMMIT_MSG" | grep -qE "$SKIP_RE"; then
             PARENT=$(gh api repos/${{ github.repository }}/commits/$WAIT_SHA --jq '.parents[0].sha')
-            echo "Commit $WAIT_SHA skips CI, walking back to parent: $PARENT"
+            echo "No build run for $WAIT_SHA and commit has skip-CI markers; walking back to parent: $PARENT"
             WAIT_SHA="$PARENT"
             continue
           fi
