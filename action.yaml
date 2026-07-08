@@ -5,9 +5,19 @@ inputs:
     description: 'v* tag to use when tagging image'
     required: true
   ECR_REGISTRY:
-    description: 'AWS ECR registry where images are'
-    required: true
-  aws-account: 
+    description: 'AWS ECR registry where images are. Provide this OR HARBOR_REGISTRY.'
+    required: false
+    default: ''
+  HARBOR_REGISTRY:
+    description: 'Harbor registry where images are (e.g. harbor.bisnow.cloud/bisnow/my-service). Provide this OR ECR_REGISTRY.'
+    required: false
+    default: ''
+  only-harbor:
+    description: 'Use only Harbor, no ECR'
+    required: false
+    type: boolean
+    default: false
+  aws-account:
     description: 'Aws account to assume'
     required: false
     default: 'bisnow'
@@ -119,15 +129,48 @@ runs:
           exit 1
         fi
 
+    - name: Validate registry inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.ECR_REGISTRY }}" ] && [ -z "${{ inputs.HARBOR_REGISTRY }}" ]; then
+          echo "❌ You must provide either ECR_REGISTRY or HARBOR_REGISTRY"
+          exit 1
+        fi
+        if [ "${{ inputs.only-harbor }}" == "true" ] && [ -z "${{ inputs.HARBOR_REGISTRY }}" ]; then
+          echo "❌ only-harbor is true but HARBOR_REGISTRY was not provided"
+          exit 1
+        fi
+
     - name: Checkout Repository
       uses: actions/checkout@v6
       with:
         fetch-depth: 0
 
     - name: Assume role for AWS Account
+      if: ${{ inputs.only-harbor != 'true' }}
       uses: bisnow/github-actions-assume-role-for-environment@main
       with:
         aws-account: ${{ inputs.aws-account }}
+
+    - name: Save Harbor credentials
+      if: ${{ inputs.only-harbor == 'true' }}
+      id: harbor-creds
+      shell: bash
+      run: |
+        if [ -f /home/runner/.docker/config.json ]; then
+          HARBOR_PASSWORD=$(python3 -c "import json; c=json.load(open('/home/runner/.docker/config.json')); print(c['auths']['harbor.bisnow.cloud']['password'])")
+          echo "::add-mask::${HARBOR_PASSWORD}"
+          echo "password=${HARBOR_PASSWORD}" >> $GITHUB_OUTPUT
+        else
+          echo "::error::No Docker config found at /home/runner/.docker/config.json — Harbor credentials unavailable"
+          exit 1
+        fi
+
+    - name: Login to Harbor
+      if: ${{ inputs.only-harbor == 'true' }}
+      shell: bash
+      run: |
+        echo "${{ steps.harbor-creds.outputs.password }}" | docker login harbor.bisnow.cloud -u 'robot$arc-cicd' --password-stdin
 
     - name: Find Image for Build Commit
       id: find_image_commit
@@ -136,18 +179,39 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: |
         GIT_SHA="${{ steps.wait-for-build.outputs.build_sha }}"
-        REPO_NAME="${{ inputs.ECR_REGISTRY }}"
-        REPO_NAME="${REPO_NAME#*/}"
+        ONLY_HARBOR="${{ inputs.only-harbor }}"
         MAX_HOPS=20
 
-        # Walk back through commit parents until we find one with an image
-        # in ECR. The build workflow may have been skipped (e.g. no source
-        # changes) or only updated k8s manifests, so the tagged commit
-        # itself may not have an image even when its build run reports
-        # success.
+        if [ "$ONLY_HARBOR" == "true" ]; then
+          # harbor.bisnow.cloud/<project>/<repo...>
+          HARBOR_PATH="${{ inputs.HARBOR_REGISTRY }}"
+          HARBOR_PATH="${HARBOR_PATH#harbor.bisnow.cloud/}"
+          HARBOR_PROJECT="${HARBOR_PATH%%/*}"
+          HARBOR_REPO="${HARBOR_PATH#*/}"
+          # URL-encode any '/' in a multi-segment repo name for the Harbor API
+          HARBOR_REPO_ENC="${HARBOR_REPO//\//%2F}"
+          HARBOR_PASSWORD="${{ steps.harbor-creds.outputs.password }}"
+        else
+          REPO_NAME="${{ inputs.ECR_REGISTRY }}"
+          REPO_NAME="${REPO_NAME#*/}"
+        fi
+
+        # Returns 0 if an image tagged with $1 exists in the active registry.
+        image_exists() {
+          if [ "$ONLY_HARBOR" == "true" ]; then
+            docker manifest inspect "${{ inputs.HARBOR_REGISTRY }}:$1" >/dev/null 2>&1
+          else
+            aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$1 --region ${{ inputs.aws-region }} >/dev/null 2>&1
+          fi
+        }
+
+        # Walk back through commit parents until we find one with an image.
+        # The build workflow may have been skipped (e.g. no source changes)
+        # or only updated k8s manifests, so the tagged commit itself may not
+        # have an image even when its build run reports success.
         for hop in $(seq 1 $MAX_HOPS); do
           echo "🔍 Looking up image for commit: $GIT_SHA (hop $hop/$MAX_HOPS)"
-          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GIT_SHA --region ${{ inputs.aws-region }} >/dev/null 2>&1; then
+          if image_exists "$GIT_SHA"; then
             echo "✅ Found image for commit: $GIT_SHA"
             break
           fi
@@ -162,12 +226,20 @@ runs:
 
         # Final verification: loop may have exhausted MAX_HOPS without
         # finding an image.
-        if ! aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GIT_SHA --region ${{ inputs.aws-region }} >/dev/null 2>&1; then
-          echo "❌ Exhausted $MAX_HOPS hops walking back commits without finding an image in ECR."
+        if ! image_exists "$GIT_SHA"; then
+          echo "❌ Exhausted $MAX_HOPS hops walking back commits without finding an image."
           exit 1
         fi
 
-        DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GIT_SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -oE '(dev|rc)-[0-9]+' | head -1 || true)
+        # Find the dev/rc tag that shares this image, so it can be re-pointed
+        # alongside the release tag.
+        if [ "$ONLY_HARBOR" == "true" ]; then
+          DEV_TAG=$(curl -sf -u "robot\$arc-cicd:$HARBOR_PASSWORD" \
+            "https://harbor.bisnow.cloud/api/v2.0/projects/$HARBOR_PROJECT/repositories/$HARBOR_REPO_ENC/artifacts/$GIT_SHA/tags" \
+            | jq -r '.[].name' | grep -oE '(dev|rc)-[0-9]+' | head -1 || true)
+        else
+          DEV_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GIT_SHA --region ${{ inputs.aws-region }} --query 'imageDetails[0].imageTags' --output text | grep -oE '(dev|rc)-[0-9]+' | head -1 || true)
+        fi
 
         if [ -n "$DEV_TAG" ]; then
           echo "📦 Found associated dev/rc tag: $DEV_TAG"
@@ -179,6 +251,7 @@ runs:
         echo "dev_tag=$DEV_TAG" >> $GITHUB_OUTPUT
 
     - name: Login to Amazon ECR
+      if: ${{ inputs.only-harbor != 'true' }}
       uses: aws-actions/amazon-ecr-login@v2
 
     - name: Set up Docker Buildx
@@ -189,12 +262,20 @@ runs:
       run: |
         set -e  # Exit on any error
 
+        # Resolve the active registry
+        if [ "${{ inputs.only-harbor }}" == "true" ]; then
+          REGISTRY="${{ inputs.HARBOR_REGISTRY }}"
+        else
+          REGISTRY="${{ inputs.ECR_REGISTRY }}"
+        fi
+
         # Create and push the release tag
         RELEASE_TAG="${{ inputs.tag }}"
         GIT_SHA="${{ steps.find_image_commit.outputs.git_sha }}"
         DEV_TAG="${{ steps.find_image_commit.outputs.dev_tag }}"
 
         echo "Creating release manifest based on most recent commit with image"
+        echo "Registry: $REGISTRY"
         echo "Git SHA: $GIT_SHA"
         echo "Dev/RC tag: $DEV_TAG"
         echo "Release tag: $RELEASE_TAG"
@@ -204,24 +285,24 @@ runs:
         if [ -n "$DEV_TAG" ]; then
           echo "Creating manifest with dev/rc tag and release tag..."
           docker buildx imagetools create \
-            --tag ${{ inputs.ECR_REGISTRY }}:$DEV_TAG \
-            --tag ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG \
-            ${{ inputs.ECR_REGISTRY }}:$GIT_SHA
+            --tag $REGISTRY:$DEV_TAG \
+            --tag $REGISTRY:$RELEASE_TAG \
+            $REGISTRY:$GIT_SHA
         else
           echo "Creating manifest with only release tag (no dev/rc tag found)..."
           docker buildx imagetools create \
-            --tag ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG \
-            ${{ inputs.ECR_REGISTRY }}:$GIT_SHA
+            --tag $REGISTRY:$RELEASE_TAG \
+            $REGISTRY:$GIT_SHA
         fi
 
         # Verify the manifest was created successfully
         echo "Verifying release manifest was created..."
-        docker buildx imagetools inspect ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG
+        docker buildx imagetools inspect $REGISTRY:$RELEASE_TAG
 
         echo "✅ Successfully created release manifest"
-        echo "Release tag: ${{ inputs.ECR_REGISTRY }}:$RELEASE_TAG"
+        echo "Release tag: $REGISTRY:$RELEASE_TAG"
         if [ -n "$DEV_TAG" ]; then
-          echo "Dev/RC tag: ${{ inputs.ECR_REGISTRY }}:$DEV_TAG"
+          echo "Dev/RC tag: $REGISTRY:$DEV_TAG"
         fi
         echo "Based on Git SHA: $GIT_SHA"
         echo "Commit offset: ${{ steps.find_image_commit.outputs.commit_offset }}"
@@ -233,9 +314,13 @@ runs:
         DEV_TAG="${{ steps.find_image_commit.outputs.dev_tag }}"
         RELEASE_TAG="${{ inputs.tag }}"
         COMMIT_OFFSET="${{ steps.find_image_commit.outputs.commit_offset }}"
-        ECR_REGISTRY="${{ inputs.ECR_REGISTRY }}"
-        ACCOUNT_ID=$(echo "$ECR_REGISTRY" | cut -d. -f1)
-        REPO_NAME="${ECR_REGISTRY#*/}"
+        if [ "${{ inputs.only-harbor }}" == "true" ]; then
+          REGISTRY="${{ inputs.HARBOR_REGISTRY }}"
+        else
+          REGISTRY="${{ inputs.ECR_REGISTRY }}"
+        fi
+        ACCOUNT_ID=$(echo "${{ inputs.ECR_REGISTRY }}" | cut -d. -f1)
+        REPO_NAME="${REGISTRY#*/}"
 
         # Get commit message and author
         COMMIT_MSG=$(git log -1 --pretty=format:'%s' $GIT_SHA)
@@ -249,12 +334,12 @@ runs:
         ## Release Information
         EOF
         echo "- **Release Tag**: \`$RELEASE_TAG\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **ECR Registry**: \`$ECR_REGISTRY\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Registry**: \`$REGISTRY\`" >> $GITHUB_STEP_SUMMARY
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-        
+
         ## Which Commit Was Tagged?
-        This action searched backwards through your recent commits to find the **most recent commit with a successfully built Docker image** in ECR.
-        
+        This action searched backwards through your recent commits to find the **most recent commit with a successfully built Docker image** in the registry.
+
         ### Commit Details
         EOF
         echo "- **Git SHA**: \`$GIT_SHA\`" >> $GITHUB_STEP_SUMMARY
@@ -282,14 +367,18 @@ runs:
         ## Debugging Links
         EOF
         echo "- [View Commit on GitHub](${{ github.server_url }}/${{ github.repository }}/commit/$GIT_SHA)" >> $GITHUB_STEP_SUMMARY
-        echo "- [View ECR Images](https://console.aws.amazon.com/ecr/repositories/private/$ACCOUNT_ID/$REPO_NAME?region=${{ inputs.aws-region }})" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ inputs.only-harbor }}" == "true" ]; then
+          echo "- [View Harbor Images](https://$REGISTRY)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- [View ECR Images](https://console.aws.amazon.com/ecr/repositories/private/$ACCOUNT_ID/$REPO_NAME?region=${{ inputs.aws-region }})" >> $GITHUB_STEP_SUMMARY
+        fi
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         
         ## Tagged Images
         The following images now point to the same manifest:
         EOF
-        echo "- \`$ECR_REGISTRY:$GIT_SHA\` (original SHA tag)" >> $GITHUB_STEP_SUMMARY
-        echo "- \`$ECR_REGISTRY:$RELEASE_TAG\` (release tag)" >> $GITHUB_STEP_SUMMARY
+        echo "- \`$REGISTRY:$GIT_SHA\` (original SHA tag)" >> $GITHUB_STEP_SUMMARY
+        echo "- \`$REGISTRY:$RELEASE_TAG\` (release tag)" >> $GITHUB_STEP_SUMMARY
         if [ -n "$DEV_TAG" ]; then
-          echo "- \`$ECR_REGISTRY:$DEV_TAG\` (dev/rc tag)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$REGISTRY:$DEV_TAG\` (dev/rc tag)" >> $GITHUB_STEP_SUMMARY
         fi
