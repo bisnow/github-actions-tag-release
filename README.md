@@ -34,9 +34,23 @@ jobs:
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `tag` | Semantic version tag (e.g., v1.0.0) | Yes | - |
-| `ECR_REGISTRY` | AWS ECR registry URL | Yes | - |
-| `aws-account` | AWS account to assume | No | `bisnow` |
+| `ECR_REGISTRY` | AWS ECR registry URL. Provide this **or** `HARBOR_REGISTRY`. | No | `''` |
+| `HARBOR_REGISTRY` | Harbor registry URL (e.g. `harbor.bisnow.cloud/bisnow/my-app`). Provide this **or** `ECR_REGISTRY`. | No | `''` |
+| `only-harbor` | Tag the release only in Harbor, skipping ECR/AWS entirely. Requires `HARBOR_REGISTRY`. | No | `false` |
+| `aws-account` | AWS account to assume (ECR only) | No | `bisnow` |
 | `aws-region` | AWS region where ECR repo is located | No | `us-east-1` |
+
+### Harbor-only usage
+
+Runs on the self-hosted `arc-runners-bisnow*` runners, which are pre-authenticated to Harbor via the `arc-cicd` robot. No AWS role is assumed.
+
+```yaml
+      - uses: bisnow/github-actions-tag-release@v1
+        with:
+          tag: ${{ github.ref_name }}
+          HARBOR_REGISTRY: harbor.bisnow.cloud/bisnow/my-app
+          only-harbor: true
+```
 
 ## Outputs
 
