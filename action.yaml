@@ -157,21 +157,46 @@ runs:
       id: harbor-creds
       shell: bash
       run: |
-        if [ ! -f /home/runner/.docker/config.json ]; then
-          echo "::error::No Docker config found at /home/runner/.docker/config.json — Harbor credentials unavailable"
-          exit 1
-        fi
-        # A preceding `docker login` (e.g. the ECR promotion in the same job)
-        # re-serializes config.json and strips the plaintext `password`/`username`
-        # from every auth entry, folding them into the base64 `auth` field. So
-        # read `password` if present, otherwise decode it back out of `auth`.
+        # Prefer the credential the cluster provisions over the one docker keeps.
+        #
+        # gitops-platform lands the arc-cicd robot in the harbor-registry-creds
+        # secret and the runner's init container copies it to ~/.docker/config.json.
+        # That copy is docker's working file: a preceding `docker login` (e.g. the
+        # ECR promotion in the same job) re-serializes it and folds the plaintext
+        # `password`/`username` into the base64 `auth` field, and a runner using a
+        # credential store would leave neither behind. Reading the read-only secret
+        # mount first takes the value from the source of truth rather than from
+        # whatever the last step left on disk; the working file stays as a fallback,
+        # still handling both shapes.
         HARBOR_PASSWORD=$(python3 - <<'PY'
-        import base64, json, sys
-        e = json.load(open('/home/runner/.docker/config.json'))['auths']['harbor.bisnow.cloud']
-        pw = e.get('password') or (base64.b64decode(e['auth']).decode().split(':', 1)[1] if e.get('auth') else '')
-        if not pw:
-            sys.exit('No Harbor password or auth in docker config for harbor.bisnow.cloud')
-        print(pw)
+        import base64, json, os, sys
+
+        CANDIDATES = ('/harbor-creds/config.json', os.path.expanduser('~/.docker/config.json'))
+        REGISTRY = 'harbor.bisnow.cloud'
+
+        tried = []
+        for path in CANDIDATES:
+            if not os.path.isfile(path):
+                tried.append(f'{path} (absent)')
+                continue
+            try:
+                entry = json.load(open(path))['auths'][REGISTRY]
+            except (ValueError, KeyError) as exc:
+                tried.append(f'{path} (no {REGISTRY} entry: {exc})')
+                continue
+            pw = entry.get('password')
+            if not pw and entry.get('auth'):
+                pw = base64.b64decode(entry['auth']).decode().split(':', 1)[1]
+            if pw:
+                print(pw)
+                sys.exit(0)
+            tried.append(f'{path} (entry carries neither password nor auth)')
+
+        sys.exit(
+            'Could not resolve the Harbor robot password. Tried:\n  ' + '\n  '.join(tried)
+            + '\nExpected the harbor-registry-creds secret mounted at /harbor-creds, '
+              'or a docker config carrying the harbor.bisnow.cloud auth.'
+        )
         PY
         )
         echo "::add-mask::${HARBOR_PASSWORD}"
