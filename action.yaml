@@ -157,14 +157,25 @@ runs:
       id: harbor-creds
       shell: bash
       run: |
-        if [ -f /home/runner/.docker/config.json ]; then
-          HARBOR_PASSWORD=$(python3 -c "import json; c=json.load(open('/home/runner/.docker/config.json')); print(c['auths']['harbor.bisnow.cloud']['password'])")
-          echo "::add-mask::${HARBOR_PASSWORD}"
-          echo "password=${HARBOR_PASSWORD}" >> $GITHUB_OUTPUT
-        else
+        if [ ! -f /home/runner/.docker/config.json ]; then
           echo "::error::No Docker config found at /home/runner/.docker/config.json — Harbor credentials unavailable"
           exit 1
         fi
+        # A preceding `docker login` (e.g. the ECR promotion in the same job)
+        # re-serializes config.json and strips the plaintext `password`/`username`
+        # from every auth entry, folding them into the base64 `auth` field. So
+        # read `password` if present, otherwise decode it back out of `auth`.
+        HARBOR_PASSWORD=$(python3 - <<'PY'
+        import base64, json, sys
+        e = json.load(open('/home/runner/.docker/config.json'))['auths']['harbor.bisnow.cloud']
+        pw = e.get('password') or (base64.b64decode(e['auth']).decode().split(':', 1)[1] if e.get('auth') else '')
+        if not pw:
+            sys.exit('No Harbor password or auth in docker config for harbor.bisnow.cloud')
+        print(pw)
+        PY
+        )
+        echo "::add-mask::${HARBOR_PASSWORD}"
+        echo "password=${HARBOR_PASSWORD}" >> $GITHUB_OUTPUT
 
     - name: Login to Harbor
       if: ${{ inputs.only-harbor == 'true' }}
